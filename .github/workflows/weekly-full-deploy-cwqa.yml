@@ -1,0 +1,207 @@
+# =============================================================================
+# Cloud Wave — Weekly Full Deploy to cwQA
+# Runs every Sunday at 00:00 UTC (also triggerable manually).
+#
+# Purpose: Wipe metadata drift that delta deployments may miss.
+#   Delta deployments only deploy what changed — if metadata was manually
+#   edited in the org or a delete was missed, drift accumulates over time.
+#   This weekly full deploy realigns the cwQA org with the cwqa branch source.
+#
+# Strategy: Full manifest (not delta) via sf project generate manifest.
+# Test level: RunLocalTests.
+# Retry: 1 automatic retry (2 total attempts), 60-min timeout each (full deploys are slower).
+# Artifact: weekly-full-deploy-cwqa-<shortSHA> retained 30 days.
+# =============================================================================
+name: "CW Weekly Full Deploy → cwQA"
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"   # Sunday at 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual trigger (optional, for audit log)"
+        required: false
+        type: string
+        default: "Manual trigger"
+
+concurrency:
+  group: deploy-cwqa
+  cancel-in-progress: false
+
+env:
+  ORG_ALIAS: cwQA
+
+jobs:
+  weekly-full-deploy:
+    name: "Weekly Full Deploy to cwQA"
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: "Checkout cwqa branch"
+        uses: actions/checkout@v4
+        with:
+          ref: cwqa
+          fetch-depth: 1
+
+      # -----------------------------------------------------------------------
+      - name: "Install Salesforce CLI"
+        run: |
+          npm install --global @salesforce/cli@latest
+          sf version --verbose
+
+      # -----------------------------------------------------------------------
+      - name: "Write JWT key"
+        run: |
+          echo "${{ secrets.SFDX_JWT_KEY_FILE }}" > /tmp/server.key
+          chmod 600 /tmp/server.key
+
+      # -----------------------------------------------------------------------
+      - name: "Authenticate to cwQA"
+        run: |
+          sf org login jwt \
+            --username    "${{ secrets.SFDX_USERNAME_CWQA }}" \
+            --jwt-key-file /tmp/server.key \
+            --client-id   "${{ secrets.SFDX_CONSUMER_KEY_CWQA }}" \
+            --alias       "${{ env.ORG_ALIAS }}" \
+            --no-prompt
+
+      # -----------------------------------------------------------------------
+      - name: "Pre-flight checks"
+        run: |
+          echo "::group::Pre-flight: Org Display"
+          sf org display --target-org "${{ env.ORG_ALIAS }}" --json
+          echo "::endgroup::"
+          echo "::group::Pre-flight: API Limits"
+          sf limits api display --target-org "${{ env.ORG_ALIAS }}" --json
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Generate full source manifest"
+        run: |
+          echo "::group::Full Manifest Generation"
+          mkdir -p artifact
+
+          SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "Deployment Mode : FULL"
+          echo "Target Org      : ${{ env.ORG_ALIAS }}"
+          echo "Commit SHA      : ${{ github.sha }}"
+          echo "Branch          : cwqa"
+          echo "Test Level      : RunLocalTests"
+          echo "Trigger         : ${{ github.event_name }}"
+          [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && \
+            echo "Reason          : ${{ inputs.reason }}"
+
+          # Fix 9: Explicit manifest generation from full force-app source tree
+          sf project generate manifest \
+            --source-dir force-app \
+            --output-dir artifact \
+            --name package
+
+          # Create empty destructiveChanges.xml — no deletions on a full sync deploy
+          cat > artifact/destructiveChanges.xml <<XML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+              <version>62.0</version>
+          </Package>
+          XML
+
+          echo "=== Full package.xml ==="
+          cat artifact/package.xml
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Empty manifest guard"
+        run: |
+          if [ ! -f artifact/package.xml ] || ! grep -q "<members>" artifact/package.xml 2>/dev/null; then
+            echo "::notice::Full manifest contains no deployable members (empty source tree?). Skipping deploy."
+            exit 0
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: "Compute short SHA"
+        id: sha
+        run: echo "short=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      - name: "Write deploy-metadata.json"
+        run: |
+          cat > artifact/deploy-metadata.json <<JSON
+          {
+            "sha":        "${{ github.sha }}",
+            "shortSha":   "${{ steps.sha.outputs.short }}",
+            "branch":     "cwqa",
+            "org":        "${{ env.ORG_ALIAS }}",
+            "timestamp":  "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "testLevel":  "RunLocalTests",
+            "isDelta":    false,
+            "deployType": "weekly-full",
+            "trigger":    "${{ github.event_name }}",
+            "workflow":   "${{ github.workflow }}",
+            "runId":      "${{ github.run_id }}"
+          }
+          JSON
+
+      # -----------------------------------------------------------------------
+      - name: "Full deploy to cwQA (RunLocalTests, with retry)"
+        run: |
+          PACKAGE_XML="artifact/package.xml"
+          ORG="${{ env.ORG_ALIAS }}"
+          MAX_ATTEMPTS=2
+          ATTEMPT=1
+          FINAL_STATUS="Unknown"
+
+          while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+            echo "==> Full deploy attempt $ATTEMPT of $MAX_ATTEMPTS"
+
+            DEPLOY_OUTPUT=$(sf project deploy start \
+              --manifest   "$PACKAGE_XML" \
+              --target-org "$ORG" \
+              --wait       60 \
+              --test-level RunLocalTests \
+              --json 2>&1 || true)
+
+            FINAL_STATUS=$(echo "$DEPLOY_OUTPUT" | python3 -c "
+          import sys, json
+          try:
+              d = json.loads(sys.stdin.read())
+              print(d.get('result', {}).get('status', 'Unknown'))
+          except Exception:
+              print('ParseError')
+          " 2>/dev/null || echo "ParseError")
+
+            echo "$DEPLOY_OUTPUT"
+            echo "Deploy status: $FINAL_STATUS"
+
+            if [[ "$FINAL_STATUS" == "Succeeded" ]]; then
+              echo "Full deploy succeeded on attempt $ATTEMPT."
+              break
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+            if [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; then
+              echo "Retrying in 30 seconds..."
+              sleep 30
+            fi
+          done
+
+          if [[ "$FINAL_STATUS" != "Succeeded" ]]; then
+            echo "::error::All deploy attempts failed. Final status: $FINAL_STATUS"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: "Upload Full Context Artifact"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-full-deploy-cwqa-${{ steps.sha.outputs.short }}
+          path: artifact/
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      - name: "Cleanup JWT key"
+        if: always()
+        run: rm -f /tmp/server.key
