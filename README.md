@@ -1,7 +1,3 @@
-Got you—here’s a clean, no-formatting, copy-paste-ready README (no special blocks, no weird IDs):
-
-⸻
-
 🌊 Cloud Wave — Salesforce CI/CD Pipeline
 
 Cloud Wave is a production-grade Salesforce CI/CD pipeline built from scratch using GitHub Actions and Salesforce CLI. It enables safe, automated deployments across multiple environments with validation, rollback capability, and full auditability.
