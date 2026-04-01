@@ -1,0 +1,39 @@
+# Salesforce DX
+.sfdx/
+.sf/
+.localdevserver/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VS Code
+.vscode/settings.json
+.vscode/launch.json
+
+# JetBrains IDEs
+.idea/
+
+# Secrets — never commit these
+.env
+*.pem
+server.key
+*.key
+
+# Build artifacts
+dist/
+build/
+
+# Test results
+test-results/
+coverage/
+
+# Deployment artifacts (stored in GitHub Artifacts, not git)
+artifact/
+.validation-job-id

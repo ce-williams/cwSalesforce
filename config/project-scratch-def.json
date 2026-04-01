@@ -1,0 +1,24 @@
+{
+  "orgName": "Cloud Wave Dev",
+  "edition": "Developer",
+  "features": [
+    "EnableSetPasswordInApi",
+    "Communities",
+    "ServiceCloud"
+  ],
+  "settings": {
+    "lightningExperienceSettings": {
+      "enableS1DesktopEnabled": true
+    },
+    "mobileSettings": {
+      "enableS1EncryptedStoragePref2": false
+    },
+    "securitySettings": {
+      "passwordPolicies": {
+        "enableSetPasswordInApi": true
+      }
+    }
+  },
+  "hasSampleData": false,
+  "language": "en_US"
+}

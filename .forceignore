@@ -1,0 +1,25 @@
+# Standard Salesforce DX ignores
+.forceignore
+.gitignore
+.prettierignore
+.prettierrc
+package.json
+package-lock.json
+node_modules/
+
+# Managed package components (read-only in target org)
+**/profiles/Standard*.profile-meta.xml
+**/profiles/Admin.profile-meta.xml
+
+# Local dev artifacts
+.sf/
+.sfdx/
+
+# Wave/CRM Analytics — deployed separately
+**/wave/
+
+# Experience Cloud auto-generated pages
+**/experiences/**/pages/
+
+# Scratch org info
+**/scratchOrgInfos/

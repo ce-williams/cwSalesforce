@@ -1,0 +1,281 @@
+# =============================================================================
+# Cloud Wave — PR Validation Workflow
+# Triggers on PRs targeting cwqa, cwfull, or cwprod branches.
+# Performs delta-based check-only validation with smart test level selection.
+# Saves validation Job ID to cache for potential quick deploy downstream.
+# =============================================================================
+name: "CW Validate PR"
+
+on:
+  pull_request:
+    branches:
+      - cwqa
+      - cwfull
+      - cwprod
+
+concurrency:
+  group: deploy-${{ github.base_ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: "Validate → ${{ github.base_ref }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: "Checkout (full history)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      - name: "Resolve org config from target branch"
+        id: org
+        run: |
+          case "${{ github.base_ref }}" in
+            cwqa)
+              echo "alias=cwQA"                                                         >> "$GITHUB_OUTPUT"
+              echo "consumer_key=${{ secrets.SFDX_CONSUMER_KEY_CWQA }}"                >> "$GITHUB_OUTPUT"
+              echo "username=${{ secrets.SFDX_USERNAME_CWQA }}"                        >> "$GITHUB_OUTPUT"
+              ;;
+            cwfull)
+              echo "alias=cwFull"                                                        >> "$GITHUB_OUTPUT"
+              echo "consumer_key=${{ secrets.SFDX_CONSUMER_KEY_CWFULL }}"              >> "$GITHUB_OUTPUT"
+              echo "username=${{ secrets.SFDX_USERNAME_CWFULL }}"                      >> "$GITHUB_OUTPUT"
+              ;;
+            cwprod)
+              echo "alias=cwProd"                                                        >> "$GITHUB_OUTPUT"
+              echo "consumer_key=${{ secrets.SFDX_CONSUMER_KEY_CWPROD }}"              >> "$GITHUB_OUTPUT"
+              echo "username=${{ secrets.SFDX_USERNAME_CWPROD }}"                      >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "ERROR: Unknown target branch '${{ github.base_ref }}'" >&2
+              exit 1
+              ;;
+          esac
+
+      # -----------------------------------------------------------------------
+      - name: "Install Salesforce CLI"
+        run: |
+          npm install --global @salesforce/cli@latest
+          sf version --verbose
+
+      # -----------------------------------------------------------------------
+      - name: "Install sfdx-git-delta"
+        run: |
+          echo 'y' | sf plugins install sfdx-git-delta
+          sf sgd --version
+
+      # -----------------------------------------------------------------------
+      - name: "Write JWT key"
+        run: |
+          echo "${{ secrets.SFDX_JWT_KEY_FILE }}" > /tmp/server.key
+          chmod 600 /tmp/server.key
+
+      # -----------------------------------------------------------------------
+      - name: "Authenticate to ${{ steps.org.outputs.alias }}"
+        run: |
+          sf org login jwt \
+            --username    "${{ steps.org.outputs.username }}" \
+            --jwt-key-file /tmp/server.key \
+            --client-id   "${{ steps.org.outputs.consumer_key }}" \
+            --alias       "${{ steps.org.outputs.alias }}" \
+            --no-prompt
+
+      # -----------------------------------------------------------------------
+      - name: "Pre-flight checks"
+        run: |
+          echo "::group::Pre-flight: Org Display"
+          sf org display --target-org "${{ steps.org.outputs.alias }}" --json
+          echo "::endgroup::"
+          echo "::group::Pre-flight: API Limits"
+          sf limits api display --target-org "${{ steps.org.outputs.alias }}" --json
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Generate delta package"
+        run: |
+          echo "::group::Delta Generation"
+          mkdir -p artifact/source
+
+          FROM_SHA="${{ github.event.pull_request.base.sha }}"
+          TO_SHA="${{ github.event.pull_request.head.sha }}"
+
+          echo "Delta from : $FROM_SHA"
+          echo "Delta to   : $TO_SHA"
+
+          sf sgd source delta \
+            --from "$FROM_SHA" \
+            --to   "$TO_SHA" \
+            --output artifact/source \
+            --generate-delta \
+            --ignore .forceignore
+
+          cp -f artifact/source/package/package.xml          artifact/package.xml          2>/dev/null || true
+          cp -f artifact/source/destructiveChanges/destructiveChanges.xml \
+                                                             artifact/destructiveChanges.xml 2>/dev/null || true
+
+          echo "=== package.xml ==="
+          cat artifact/package.xml 2>/dev/null || echo "(empty)"
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Empty delta guard"
+        run: |
+          if [ ! -f artifact/package.xml ] || ! grep -q "<members>" artifact/package.xml 2>/dev/null; then
+            echo "::notice::No deployable metadata in delta. Skipping validation."
+            exit 0
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: "Inject always-include metadata types (idempotent)"
+        run: |
+          echo "::group::Dependency Buffer Injection"
+          PACKAGE_XML="artifact/package.xml"
+          FORCE_APP_DIR="force-app/main/default"
+
+          inject_type() {
+            local TYPE_NAME="$1" EXTENSION="$2" SOURCE_DIR="$3"
+
+            # Idempotency check — skip if already present
+            if grep -q "<name>${TYPE_NAME}</name>" "$PACKAGE_XML" 2>/dev/null; then
+              echo "  $TYPE_NAME already in package.xml — skipping."
+              return
+            fi
+
+            local MEMBERS
+            MEMBERS=$(find "$SOURCE_DIR" -name "*.$EXTENSION" 2>/dev/null \
+              | sed "s|${SOURCE_DIR}/||; s|\\.${EXTENSION}||" \
+              | sort | tr '\n' ',' | sed 's/,$//')
+
+            if [[ -z "$MEMBERS" ]]; then
+              echo "  No $TYPE_NAME members found in source — skipping."
+              return
+            fi
+
+            echo "  Injecting $TYPE_NAME: $MEMBERS"
+            python3 - "$PACKAGE_XML" "$TYPE_NAME" "$MEMBERS" <<'PYEOF'
+          import sys
+          pkg, tname, csv = sys.argv[1], sys.argv[2], sys.argv[3]
+          lines = "".join(f"        <members>{m}</members>\n" for m in csv.split(",") if m.strip())
+          block = f"    <types>\n{lines}        <name>{tname}</name>\n    </types>\n"
+          with open(pkg) as f:
+              content = f.read()
+          content = content.replace("</Package>", block + "</Package>")
+          with open(pkg, "w") as f:
+              f.write(content)
+          PYEOF
+          }
+
+          inject_type "Profile"       "profile-meta.xml"       "$FORCE_APP_DIR/profiles"
+          inject_type "PermissionSet" "permissionset-meta.xml" "$FORCE_APP_DIR/permissionsets"
+          inject_type "Flow"          "flow-meta.xml"          "$FORCE_APP_DIR/flows"
+
+          echo "=== Final package.xml ==="
+          cat "$PACKAGE_XML"
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Detect test classes from delta source files"
+        id: tests
+        run: |
+          # Fix 3: Scan actual *Test.cls files in delta source — not package.xml member names.
+          # This guarantees we never pass zero classes to RunSpecifiedTests.
+          TEST_CLASSES=$(find artifact/source -name "*Test.cls" 2>/dev/null \
+            | xargs -I{} basename {} .cls 2>/dev/null \
+            | sort -u | tr '\n' ',' | sed 's/,$//')
+
+          echo "Deployment Mode : CHECK-ONLY VALIDATE"
+          echo "Target Org      : ${{ steps.org.outputs.alias }}"
+          echo "Commit SHA      : ${{ github.event.pull_request.head.sha }}"
+          echo "Branch (target) : ${{ github.base_ref }}"
+
+          if [[ -n "$TEST_CLASSES" ]]; then
+            echo "Test Level      : RunSpecifiedTests"
+            echo "Test Classes    : $TEST_CLASSES"
+            echo "test_flags=--test-level RunSpecifiedTests --tests ${TEST_CLASSES}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Test Level      : RunLocalTests (no *Test.cls files in delta)"
+            echo "test_flags=--test-level RunLocalTests" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: "Validate deployment (check-only)"
+        id: validate_deploy
+        run: |
+          PACKAGE_XML="artifact/package.xml"
+          ORG="${{ steps.org.outputs.alias }}"
+
+          echo "::group::Check-Only Validation"
+
+          VALIDATE_OUTPUT=$(sf project deploy validate \
+            --manifest    "$PACKAGE_XML" \
+            --target-org  "$ORG" \
+            --wait        55 \
+            ${{ steps.tests.outputs.test_flags }} \
+            --json 2>&1 || true)
+
+          echo "$VALIDATE_OUTPUT"
+
+          VALIDATE_STATUS=$(echo "$VALIDATE_OUTPUT" | python3 -c "
+          import sys, json
+          try:
+              d = json.loads(sys.stdin.read())
+              print(d.get('result', {}).get('status', 'Unknown'))
+          except Exception:
+              print('ParseError')
+          " 2>/dev/null || echo "ParseError")
+
+          VALIDATE_JOB_ID=$(echo "$VALIDATE_OUTPUT" | python3 -c "
+          import sys, json
+          try:
+              d = json.loads(sys.stdin.read())
+              print(d.get('result', {}).get('id', ''))
+          except Exception:
+              print('')
+          " 2>/dev/null || echo "")
+
+          echo "Validate status : $VALIDATE_STATUS"
+          echo "Validate job ID : $VALIDATE_JOB_ID"
+          echo "job_id=$VALIDATE_JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+          if [[ "$VALIDATE_STATUS" != "Succeeded" ]]; then
+            echo "::error::Validation failed with status: $VALIDATE_STATUS"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # Cache validation Job ID indexed by PR head SHA.
+      # Deploy workflows can attempt sf project deploy quick using this ID.
+      # Note: Quick deploy only works if the PR head SHA matches github.sha
+      # at deploy time (i.e., fast-forward merges). The deploy workflows
+      # always fall back to a full deploy if the cache is not found.
+      # -----------------------------------------------------------------------
+      - name: "Write validation job ID to file"
+        if: steps.validate_deploy.outputs.job_id != ''
+        run: |
+          echo "${{ steps.validate_deploy.outputs.job_id }}" > .validation-job-id
+
+      - name: "Cache validation job ID"
+        if: steps.validate_deploy.outputs.job_id != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .validation-job-id
+          key: validation-job-id-${{ github.event.pull_request.head.sha }}
+
+      # -----------------------------------------------------------------------
+      - name: "Upload validation artifact on failure"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validate-failure-${{ github.base_ref }}-${{ github.run_id }}
+          path: artifact/
+          retention-days: 7
+
+      # -----------------------------------------------------------------------
+      - name: "Cleanup JWT key"
+        if: always()
+        run: rm -f /tmp/server.key

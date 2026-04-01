@@ -1,0 +1,281 @@
+# =============================================================================
+# Cloud Wave — Deploy to cwProd
+# Triggers on push (merge) to the cwprod branch.
+#
+# IMPORTANT — Branch protection on cwprod MUST be configured in GitHub Settings:
+#   - Require pull request before merging: YES
+#   - Required approvals: 1 (non-author peer review enforced via "dismiss stale reviews")
+#   - Require status checks: "CW Validate PR / Validate → cwprod"
+#   - Restrict force pushes and deletions: YES
+#   This workflow does NOT enforce approval — that is GitHub's branch protection responsibility.
+#
+# Test level: RunLocalTests.
+# Tags successful deploy: prod-stable-YYYYMMDD-<shortSHA>.
+# Retry: 1 automatic retry (2 total attempts), 30-min timeout each.
+# Artifact: deploy-cwprod-<shortSHA> retained 90 days.
+# =============================================================================
+name: "CW Deploy → cwProd"
+
+on:
+  push:
+    branches:
+      - cwprod
+
+concurrency:
+  group: deploy-cwprod
+  cancel-in-progress: false
+
+env:
+  ORG_ALIAS: cwProd
+
+jobs:
+  deploy:
+    name: "Deploy to cwProd"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    # Required to create and push git tags
+    permissions:
+      contents: write
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: "Checkout (full history)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      - name: "Install Salesforce CLI"
+        run: |
+          npm install --global @salesforce/cli@latest
+          sf version --verbose
+
+      # -----------------------------------------------------------------------
+      - name: "Install sfdx-git-delta"
+        run: |
+          echo 'y' | sf plugins install sfdx-git-delta
+          sf sgd --version
+
+      # -----------------------------------------------------------------------
+      - name: "Write JWT key"
+        run: |
+          echo "${{ secrets.SFDX_JWT_KEY_FILE }}" > /tmp/server.key
+          chmod 600 /tmp/server.key
+
+      # -----------------------------------------------------------------------
+      - name: "Authenticate to cwProd"
+        run: |
+          sf org login jwt \
+            --username    "${{ secrets.SFDX_USERNAME_CWPROD }}" \
+            --jwt-key-file /tmp/server.key \
+            --client-id   "${{ secrets.SFDX_CONSUMER_KEY_CWPROD }}" \
+            --alias       "${{ env.ORG_ALIAS }}" \
+            --no-prompt
+
+      # -----------------------------------------------------------------------
+      - name: "Pre-flight checks"
+        run: |
+          echo "::group::Pre-flight: Org Display"
+          sf org display --target-org "${{ env.ORG_ALIAS }}" --json
+          echo "::endgroup::"
+          echo "::group::Pre-flight: API Limits"
+          sf limits api display --target-org "${{ env.ORG_ALIAS }}" --json
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Generate delta package"
+        run: |
+          echo "::group::Delta Generation"
+          mkdir -p artifact/source
+
+          FROM_SHA="${{ github.event.before }}"
+          TO_SHA="${{ github.sha }}"
+
+          if [[ "$FROM_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "First push detected — using HEAD~1 as FROM"
+            FROM_SHA="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+
+          echo "Deployment Mode : DELTA"
+          echo "Target Org      : ${{ env.ORG_ALIAS }}"
+          echo "Commit SHA      : $TO_SHA"
+          echo "Branch          : ${{ github.ref_name }}"
+          echo "Test Level      : RunLocalTests"
+          echo "Delta from      : $FROM_SHA"
+          echo "Delta to        : $TO_SHA"
+
+          sf sgd source delta \
+            --from "$FROM_SHA" \
+            --to   "$TO_SHA" \
+            --output artifact/source \
+            --generate-delta \
+            --ignore .forceignore
+
+          cp -f artifact/source/package/package.xml          artifact/package.xml          2>/dev/null || true
+          cp -f artifact/source/destructiveChanges/destructiveChanges.xml \
+                                                             artifact/destructiveChanges.xml 2>/dev/null || true
+
+          echo "=== package.xml ==="
+          cat artifact/package.xml 2>/dev/null || echo "(empty)"
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Empty delta guard"
+        run: |
+          if [ ! -f artifact/package.xml ] || ! grep -q "<members>" artifact/package.xml 2>/dev/null; then
+            echo "::notice::No deployable metadata detected. Skipping deploy."
+            exit 0
+          fi
+
+      # -----------------------------------------------------------------------
+      - name: "Inject always-include metadata types (idempotent)"
+        run: |
+          echo "::group::Dependency Buffer Injection"
+          PACKAGE_XML="artifact/package.xml"
+          FORCE_APP_DIR="force-app/main/default"
+
+          inject_type() {
+            local TYPE_NAME="$1" EXTENSION="$2" SOURCE_DIR="$3"
+            if grep -q "<name>${TYPE_NAME}</name>" "$PACKAGE_XML" 2>/dev/null; then
+              echo "  $TYPE_NAME already in package.xml — skipping."
+              return
+            fi
+            local MEMBERS
+            MEMBERS=$(find "$SOURCE_DIR" -name "*.$EXTENSION" 2>/dev/null \
+              | sed "s|${SOURCE_DIR}/||; s|\\.${EXTENSION}||" \
+              | sort | tr '\n' ',' | sed 's/,$//')
+            if [[ -z "$MEMBERS" ]]; then
+              echo "  No $TYPE_NAME members found in source — skipping."
+              return
+            fi
+            echo "  Injecting $TYPE_NAME: $MEMBERS"
+            python3 - "$PACKAGE_XML" "$TYPE_NAME" "$MEMBERS" <<'PYEOF'
+          import sys
+          pkg, tname, csv = sys.argv[1], sys.argv[2], sys.argv[3]
+          lines = "".join(f"        <members>{m}</members>\n" for m in csv.split(",") if m.strip())
+          block = f"    <types>\n{lines}        <name>{tname}</name>\n    </types>\n"
+          with open(pkg) as f:
+              content = f.read()
+          content = content.replace("</Package>", block + "</Package>")
+          with open(pkg, "w") as f:
+              f.write(content)
+          PYEOF
+          }
+
+          inject_type "Profile"       "profile-meta.xml"       "$FORCE_APP_DIR/profiles"
+          inject_type "PermissionSet" "permissionset-meta.xml" "$FORCE_APP_DIR/permissionsets"
+          inject_type "Flow"          "flow-meta.xml"          "$FORCE_APP_DIR/flows"
+
+          echo "=== Final package.xml ==="
+          cat "$PACKAGE_XML"
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: "Compute prod tag and short SHA"
+        id: tag
+        run: |
+          SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          DATE=$(date -u +%Y%m%d)
+          TAG="prod-stable-${DATE}-${SHORT}"
+          echo "short=$SHORT"  >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "Production tag : $TAG"
+
+      # -----------------------------------------------------------------------
+      - name: "Write deploy-metadata.json"
+        run: |
+          cat > artifact/deploy-metadata.json <<JSON
+          {
+            "sha":        "${{ github.sha }}",
+            "shortSha":   "${{ steps.tag.outputs.short }}",
+            "branch":     "${{ github.ref_name }}",
+            "org":        "${{ env.ORG_ALIAS }}",
+            "timestamp":  "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "testLevel":  "RunLocalTests",
+            "isDelta":    true,
+            "deployType": "delta",
+            "prodTag":    "${{ steps.tag.outputs.tag }}",
+            "workflow":   "${{ github.workflow }}",
+            "runId":      "${{ github.run_id }}"
+          }
+          JSON
+
+      # -----------------------------------------------------------------------
+      - name: "Deploy to cwProd (RunLocalTests, with retry)"
+        id: deploy
+        run: |
+          PACKAGE_XML="artifact/package.xml"
+          ORG="${{ env.ORG_ALIAS }}"
+          MAX_ATTEMPTS=2
+          ATTEMPT=1
+          FINAL_STATUS="Unknown"
+
+          while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+            echo "==> Deploy attempt $ATTEMPT of $MAX_ATTEMPTS"
+
+            DEPLOY_OUTPUT=$(sf project deploy start \
+              --manifest   "$PACKAGE_XML" \
+              --target-org "$ORG" \
+              --wait       30 \
+              --test-level RunLocalTests \
+              --json 2>&1 || true)
+
+            FINAL_STATUS=$(echo "$DEPLOY_OUTPUT" | python3 -c "
+          import sys, json
+          try:
+              d = json.loads(sys.stdin.read())
+              print(d.get('result', {}).get('status', 'Unknown'))
+          except Exception:
+              print('ParseError')
+          " 2>/dev/null || echo "ParseError")
+
+            echo "$DEPLOY_OUTPUT"
+            echo "Deploy status: $FINAL_STATUS"
+
+            if [[ "$FINAL_STATUS" == "Succeeded" ]]; then
+              echo "Deploy succeeded on attempt $ATTEMPT."
+              break
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+            if [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; then
+              echo "Retrying in 15 seconds..."
+              sleep 15
+            fi
+          done
+
+          if [[ "$FINAL_STATUS" != "Succeeded" ]]; then
+            echo "::error::All deploy attempts failed. Final status: $FINAL_STATUS"
+            exit 1
+          fi
+
+          echo "status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      - name: "Upload Full Context Artifact"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-cwprod-${{ steps.tag.outputs.short }}
+          path: artifact/
+          retention-days: 90
+
+      # -----------------------------------------------------------------------
+      # Tag the commit with prod-stable-YYYYMMDD-<shortSHA> only on success.
+      # Artifact name and tag name both use shortSHA for consistent lookup in rollback.yml.
+      # -----------------------------------------------------------------------
+      - name: "Tag successful production deploy"
+        if: steps.deploy.outputs.status == 'Succeeded'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Production deploy: $TAG (run ${{ github.run_id }})"
+          git push origin "$TAG"
+          echo "::notice::Tagged: $TAG"
+
+      # -----------------------------------------------------------------------
+      - name: "Cleanup JWT key"
+        if: always()
+        run: rm -f /tmp/server.key

@@ -1,0 +1,39 @@
+{
+  "records": [
+    {
+      "attributes": { "type": "Account", "referenceId": "Acc1" },
+      "Name": "Cloud Wave Sample Account",
+      "Industry": "Technology",
+      "BillingCity": "San Francisco",
+      "BillingState": "CA",
+      "BillingCountry": "US",
+      "Phone": "415-555-0100",
+      "Website": "https://cloudwave.example.com",
+      "NumberOfEmployees": 250,
+      "AnnualRevenue": 5000000,
+      "Description": "Seed account for Cloud Wave development environment.",
+      "Contacts": {
+        "records": [
+          {
+            "attributes": { "type": "Contact", "referenceId": "Con1" },
+            "FirstName": "Satoshi",
+            "LastName": "Nakamoto",
+            "Email": "satoshi@cw.com",
+            "Title": "Lead Architect",
+            "Department": "Engineering",
+            "Phone": "415-555-0101"
+          },
+          {
+            "attributes": { "type": "Contact", "referenceId": "Con2" },
+            "FirstName": "Jordan",
+            "LastName": "Kim",
+            "Email": "jordan.kim@cloudwave.example.com",
+            "Title": "QA Lead",
+            "Department": "Quality Assurance",
+            "Phone": "415-555-0102"
+          }
+        ]
+      }
+    }
+  ]
+}
