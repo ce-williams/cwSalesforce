@@ -218,8 +218,4 @@ Cloud Wave Project (CW)
 
 📄 License
 
-MIT (or your preferred license)
-
-⸻
-
-If you want, I can also give you a shorter “impressive GitHub repo description + tagline” for the top of the repo—that’s what people actually see first.
+MIT
