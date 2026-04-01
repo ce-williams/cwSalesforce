@@ -1,0 +1,182 @@
+# =============================================================================
+# Cloud Wave — Downstream Sync Workflows
+#
+# Job A (sync-prod-to-full):  cwprod → cwfull  [automated nightly cron]
+# Job B (sync-full-to-qa):    cwfull → cwqa    [manual workflow_dispatch only]
+#
+# Both jobs create PRs via gh cli — NO auto-merge at any point.
+# PRs are labeled "auto-sync" and must be reviewed and merged manually.
+# This ensures active QA cycles and staging environments are not disrupted.
+#
+# Reverse sync rules (per TDD):
+#   cwprod → cwfull : Automated nightly
+#   cwfull → cwqa   : Manual trigger only (protect active QA cycles)
+#   cwqa   → cwdev  : PROHIBITED (devs pull manually)
+# =============================================================================
+name: "CW Sync Downstream"
+
+on:
+  schedule:
+    # Nightly at 02:00 UTC — cwprod → cwfull
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      direction:
+        description: "Sync direction (only cwfull → cwqa is available manually)"
+        required: true
+        type: choice
+        options:
+          - "cwfull → cwqa"
+        default: "cwfull → cwqa"
+
+concurrency:
+  group: sync-downstream-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Nightly: cwprod → cwfull (automated)
+  # ---------------------------------------------------------------------------
+  sync-prod-to-full:
+    name: "Auto Sync: cwprod → cwfull"
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: "Checkout cwprod"
+        uses: actions/checkout@v4
+        with:
+          ref: cwprod
+          fetch-depth: 0
+
+      - name: "Configure git"
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: "Check if cwprod is ahead of cwfull"
+        id: diff
+        run: |
+          git fetch origin cwfull
+          DIFF=$(git rev-list --count origin/cwfull..origin/cwprod 2>/dev/null || echo "0")
+          echo "Commits ahead of cwfull: $DIFF"
+          echo "has_diff=$([[ $DIFF -gt 0 ]] && echo 'true' || echo 'false')" >> "$GITHUB_OUTPUT"
+
+      - name: "No changes to sync"
+        if: steps.diff.outputs.has_diff == 'false'
+        run: echo "cwprod is already in sync with cwfull. No PR needed."
+
+      - name: "Create sync branch and PR"
+        if: steps.diff.outputs.has_diff == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          BRANCH="sync/cwprod-to-cwfull-${DATE}"
+
+          # Create sync branch from cwprod tip
+          git checkout -b "$BRANCH"
+          git push origin "$BRANCH"
+
+          # Create PR — PRs only, no auto-merge
+          gh pr create \
+            --title "Auto Sync: cwprod → cwfull (${DATE})" \
+            --body "$(cat <<EOF
+          ## Automated Nightly Sync
+
+          This PR syncs \`cwprod\` into \`cwfull\`.
+
+          | Field   | Value |
+          |---------|-------|
+          | Source  | \`cwprod\` |
+          | Target  | \`cwfull\` |
+          | Date    | ${DATE} |
+          | Run ID  | ${{ github.run_id }} |
+
+          **Review for merge conflicts before merging.**
+          The validation workflow (\`CW Validate PR\`) will run automatically on this PR.
+          EOF
+          )" \
+            --base cwfull \
+            --head "$BRANCH" \
+            --label "auto-sync" \
+            || echo "::warning::PR may already exist for today — skipping creation."
+
+  # ---------------------------------------------------------------------------
+  # Manual: cwfull → cwqa (workflow_dispatch only)
+  # ---------------------------------------------------------------------------
+  sync-full-to-qa:
+    name: "Manual Sync: cwfull → cwqa"
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: "Checkout cwfull"
+        uses: actions/checkout@v4
+        with:
+          ref: cwfull
+          fetch-depth: 0
+
+      - name: "Configure git"
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: "Check if cwfull is ahead of cwqa"
+        id: diff
+        run: |
+          git fetch origin cwqa
+          DIFF=$(git rev-list --count origin/cwqa..origin/cwfull 2>/dev/null || echo "0")
+          echo "Commits ahead of cwqa: $DIFF"
+          echo "has_diff=$([[ $DIFF -gt 0 ]] && echo 'true' || echo 'false')" >> "$GITHUB_OUTPUT"
+
+      - name: "No changes to sync"
+        if: steps.diff.outputs.has_diff == 'false'
+        run: echo "cwfull is already in sync with cwqa. No PR needed."
+
+      - name: "Create sync branch and PR"
+        if: steps.diff.outputs.has_diff == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          RUN_ID="${{ github.run_id }}"
+          BRANCH="sync/cwfull-to-cwqa-${DATE}-${RUN_ID}"
+
+          git checkout -b "$BRANCH"
+          git push origin "$BRANCH"
+
+          # Create PR — PRs only, no auto-merge
+          gh pr create \
+            --title "Auto Sync: cwfull → cwqa (${DATE})" \
+            --body "$(cat <<EOF
+          ## Manual Downstream Sync
+
+          This PR syncs \`cwfull\` into \`cwqa\`.
+
+          | Field     | Value |
+          |-----------|-------|
+          | Source    | \`cwfull\` |
+          | Target    | \`cwqa\` |
+          | Triggered | @${{ github.actor }} |
+          | Date      | ${DATE} |
+          | Run ID    | ${RUN_ID} |
+
+          **Review carefully before merging — this may disrupt active QA cycles.**
+          The validation workflow (\`CW Validate PR\`) will run automatically on this PR.
+          EOF
+          )" \
+            --base cwqa \
+            --head "$BRANCH" \
+            --label "auto-sync" \
+            || echo "::warning::PR may already exist for today — skipping creation."
